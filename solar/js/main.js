@@ -215,12 +215,17 @@ function kepler(M, e) {
 
 // Heliocentric position from the approximate elements, returned in Mm in the render frame.
 function planetPos(k, T, out) {
+  const e = k[1] + k[7] * T;
+  const L = k[3] + k[9] * T, peri = k[4] + k[10] * T;
+  orbitPoint(k, T, kepler(wrapDeg(L - peri) * D2R, e), out);
+}
+// The point on the orbit ellipse at eccentric anomaly E; planetPos solves Kepler for E,
+// the orbit overlay just sweeps it.
+function orbitPoint(k, T, E, out) {
   const a = k[0] + k[6] * T, e = k[1] + k[7] * T;
   const I = (k[2] + k[8] * T) * D2R;
-  const L = k[3] + k[9] * T, peri = k[4] + k[10] * T, node = k[5] + k[11] * T;
-  const M = wrapDeg(L - peri) * D2R;
+  const peri = k[4] + k[10] * T, node = k[5] + k[11] * T;
   const w = (peri - node) * D2R, O = node * D2R;
-  const E = kepler(M, e);
   const xp = a * (Math.cos(E) - e);
   const yp = a * Math.sqrt(Math.max(1 - e * e, 0)) * Math.sin(E);
   const cw = Math.cos(w), sw = Math.sin(w), cO = Math.cos(O), sO = Math.sin(O);
@@ -675,8 +680,7 @@ async function main() {
   // `phase` is the angle between the sun and the camera as seen from the body: small puts
   // the sun behind you (a full, flat disc), large puts it behind the body (a thin crescent,
   // and for Saturn the spectacular backlit rings).
-  function gotoBody(b, mult, phase) {
-    updateEphemeris();
+  function parkView(b, mult, phase) {
     const d = (mult || 4.2) * Math.max(b.req, 0.002);
     const toSun = norm3([-b.pos[0], -b.pos[1], -b.pos[2]]);
     const up = [0, 1, 0];
@@ -689,15 +693,146 @@ async function main() {
       // for Saturn, come in well above the ring plane so the system opens up
       off = norm3([off[0] + b.axis[0] * 0.75, off[1] + b.axis[1] * 0.75, off[2] + b.axis[2] * 0.75]);
     }
-    cam.x = b.pos[0] + off[0] * d;
-    cam.y = b.pos[1] + off[1] * d;
-    cam.z = b.pos[2] + off[2] * d;
-    // look at the body
-    const f = norm3([b.pos[0] - cam.x, b.pos[1] - cam.y, b.pos[2] - cam.z]);
-    cam.pitch = Math.asin(Math.max(-1, Math.min(1, f[1])));
-    cam.yaw = Math.atan2(f[0], -f[2]);
+    // the camera sits at b + off * d and looks back along -off
+    return { dist: d, pitch: clampPitch(Math.asin(Math.max(-1, Math.min(1, -off[1])))),
+      yaw: Math.atan2(-off[0], off[2]) };
+  }
+  function gotoBody(b, mult, phase) {
+    updateEphemeris();
+    const v = parkView(b, mult, phase);
+    cam.yaw = goal.yaw = v.yaw;
+    cam.pitch = goal.pitch = v.pitch;
+    orbit.dist = goal.dist = v.dist;
+    orbit.pan = [0, 0, 0];
+    flight = null;
     cam.speed = 0;
     setTarget(b);
+    placeOrbit();
+  }
+
+  // Two ways to move. 'orbit', the default, keeps the camera on a sphere around the target:
+  // drag to rotate, wheel to zoom, right-drag to pan, double-click a body to fly to it.
+  // 'fly' is the free camera, with mouse look and WASD. F switches between them.
+  let mode = qs.get('nav') === 'fly' || qs.get('cam') ? 'fly' : 'orbit';
+  // the orbit camera sits at target + pan - forward * dist, looking along forward
+  const orbit = { dist: 1, pan: [0, 0, 0] };
+  // drags and wheel steps move the goal and the camera eases toward it, so nothing snaps
+  const goal = { yaw: 0, pitch: 0, dist: 1 };
+  let flight = null;
+  const clampPitch = (p) => Math.max(-1.5, Math.min(1.5, p));
+  // zooming scales the height above the surface, not the distance to the centre, so the
+  // same wheel step is as useful 20 km above the Moon as it is 20 AU out
+  const minGap = (b) => b.req * 0.003 + 1e-4;
+  function zoomBy(k) {
+    const gap = Math.max(goal.dist - target.req, minGap(target));
+    goal.dist = target.req + Math.max(minGap(target), Math.min(2e7, gap * k));
+  }
+
+  function camBasis() {
+    const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+    const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+    const f = [cp * sy, sp, -cp * cy], r = [cy, 0, sy];
+    return { f, r, u: cross3(r, f) };
+  }
+  function placeOrbit(focus) {
+    const c = focus || [target.pos[0] + orbit.pan[0], target.pos[1] + orbit.pan[1],
+      target.pos[2] + orbit.pan[2]];
+    const { f } = camBasis();
+    cam.x = c[0] - f[0] * orbit.dist;
+    cam.y = c[1] - f[1] * orbit.dist;
+    cam.z = c[2] - f[2] * orbit.dist;
+  }
+
+  // Animated trip to a body. The focus slides from where the camera is looking now to the
+  // new body (both keep moving along their orbits), the distance is interpolated in log
+  // space, and the camera pulls back mid-flight so a trip between planets reads as a trip.
+  function flyTo(b, view) {
+    updateEphemeris();
+    let from;
+    if (mode === 'fly') {
+      // express the free camera as an orbit about a point straight ahead of it
+      const D = Math.max(Math.hypot(b.pos[0] - cam.x, b.pos[1] - cam.y, b.pos[2] - cam.z), 1e-3);
+      const { f } = camBasis();
+      from = { body: target, logD: Math.log(D), yaw: cam.yaw, pitch: cam.pitch,
+        pan: [cam.x + f[0] * D - target.pos[0], cam.y + f[1] * D - target.pos[1],
+          cam.z + f[2] * D - target.pos[2]] };
+      mode = 'orbit';
+      hudMode();
+      if (document.pointerLockElement === canvas) document.exitPointerLock();
+    } else {
+      from = { body: target, logD: Math.log(orbit.dist), yaw: cam.yaw, pitch: cam.pitch,
+        pan: orbit.pan.slice() };
+    }
+    const to = view || parkView(b, b.spec.sun ? 40 : 4.2);
+    const a = [from.body.pos[0] + from.pan[0], from.body.pos[1] + from.pan[1], from.body.pos[2] + from.pan[2]];
+    const travel = Math.hypot(a[0] - b.pos[0], a[1] - b.pos[1], a[2] - b.pos[2]);
+    const dur = Math.max(0.8, Math.min(3, 0.8 + 0.35 * Math.log10(1 + travel / to.dist)));
+    // shortest way round, so a trip never spins the long way
+    let dyaw = (to.yaw - from.yaw) % (2 * Math.PI);
+    if (dyaw > Math.PI) dyaw -= 2 * Math.PI;
+    if (dyaw < -Math.PI) dyaw += 2 * Math.PI;
+    flight = { from, to, b, t: 0, dur, travel, dyaw };
+    setTarget(b);
+  }
+  function stepFlight(dt) {
+    const fl = flight;
+    fl.t = Math.min(1, fl.t + dt / fl.dur);
+    const s = fl.t * fl.t * (3 - 2 * fl.t);
+    const A = fl.from.body.pos, p = fl.from.pan, B = fl.b.pos;
+    const focus = [0, 1, 2].map((i) => (A[i] + p[i]) * (1 - s) + B[i] * s);
+    const lA = fl.from.logD, lB = Math.log(fl.to.dist);
+    const hump = Math.max(0, Math.log(fl.travel * 0.6 + 1e-9) - (lA + lB) / 2) * Math.sin(Math.PI * s);
+    orbit.dist = Math.exp(lA + (lB - lA) * s + hump);
+    cam.yaw = fl.from.yaw + fl.dyaw * s;
+    cam.pitch = fl.from.pitch + (fl.to.pitch - fl.from.pitch) * s;
+    placeOrbit(focus);
+    if (fl.t >= 1) {
+      goal.yaw = cam.yaw; goal.pitch = cam.pitch; goal.dist = orbit.dist;
+      orbit.pan = [0, 0, 0];
+      flight = null;
+    }
+  }
+
+  // Look down on the system from above the ecliptic, far enough out that a sphere of radius
+  // rAU around the Sun fits the field of view.
+  let overview = 0;
+  function systemView(rAU, instant) {
+    // W and H are still 0 when this runs at startup, before the first resize
+    const aspect = W && H ? W / H
+      : (Number(qs.get('w')) || canvas.clientWidth) / (Number(qs.get('h')) || canvas.clientHeight || 1);
+    const fit = Math.min(cam.fovY, 2 * Math.atan(Math.tan(cam.fovY * 0.5) * aspect)) * 0.5;
+    const view = { dist: rAU * AU * 1.08 / Math.sin(fit), yaw: cam.yaw, pitch: -62 * D2R };
+    if (!instant) { flyTo(SUN_B, view); return; }
+    if (mode === 'fly') { mode = 'orbit'; hudMode(); }
+    cam.yaw = goal.yaw = view.yaw;
+    cam.pitch = goal.pitch = view.pitch;
+    orbit.dist = goal.dist = view.dist;
+    orbit.pan = [0, 0, 0];
+    flight = null;
+    setTarget(SUN_B);
+    placeOrbit();
+  }
+
+  // nearest body under a screen point; small or distant bodies get a few pixels of slack
+  function pickBody(px, py) {
+    const rect = canvas.getBoundingClientRect();
+    const nx = ((px - rect.left) / rect.width) * 2 - 1;
+    const ny = 1 - ((py - rect.top) / rect.height) * 2;
+    const tanY = Math.tan(cam.fovY * 0.5), tanX = tanY * rect.width / rect.height;
+    const { f, r, u } = camBasis();
+    const d = norm3([0, 1, 2].map((i) => f[i] + r[i] * nx * tanX + u[i] * ny * tanY));
+    const slack = 12 * 2 * tanY / rect.height;
+    let hit = null, hitD = Infinity, near = null, nearMiss = slack;
+    for (const b of bodies) {
+      const rx = b.pos[0] - cam.x, ry = b.pos[1] - cam.y, rz = b.pos[2] - cam.z;
+      const dist = Math.hypot(rx, ry, rz);
+      const along = (rx * d[0] + ry * d[1] + rz * d[2]) / dist;
+      if (along <= 0) continue;
+      const miss = Math.acos(Math.min(1, along)) - Math.asin(Math.min(1, b.req / dist));
+      if (miss <= 0 && dist < hitD) { hit = b; hitD = dist; }
+      if (miss > 0 && miss < nearMiss) { near = b; nearMiss = miss; }
+    }
+    return hit || near;
   }
 
   const keys = Object.create(null);
@@ -705,41 +840,104 @@ async function main() {
   addEventListener('keydown', (e) => {
     keys[e.code] = true;
     if (e.code === 'KeyH') togglePanel();
+    if (e.code === 'KeyO') showOrbits = !showOrbits;
+    // V alternates between the whole system and the inner planets
+    if (e.code === 'KeyV') { overview = overview === 1 ? 2 : 1; systemView(overview === 1 ? 33 : 1.75); }
+    if (e.code === 'KeyF') {
+      if (mode === 'orbit') {
+        // stay exactly where we are and fly on from here
+        mode = 'fly';
+        flight = null;
+        setTarget(target);
+        hudMode();
+      } else {
+        // orbit the target from where the free camera is, turning to face it
+        const dx = target.pos[0] - cam.x, dy = target.pos[1] - cam.y, dz = target.pos[2] - cam.z;
+        const D = Math.max(Math.hypot(dx, dy, dz), target.req + minGap(target));
+        flyTo(target, { dist: D, pitch: clampPitch(Math.asin(dy / D)), yaw: Math.atan2(dx, -dz) });
+      }
+    }
     if (e.code === 'BracketLeft' || e.code === 'BracketRight') {
       const list = bodies.filter((b) => !b.spec.sun);
       let i = list.indexOf(target);
       if (i < 0) i = 0;
       i = (i + (e.code === 'BracketRight' ? 1 : list.length - 1)) % list.length;
-      setTarget(list[i]);
+      if (mode === 'orbit') flyTo(list[i]); else setTarget(list[i]);
     }
-    if (e.code === 'KeyG') gotoBody(target);
+    if (e.code === 'KeyG') { if (mode === 'orbit') flyTo(target); else gotoBody(target); }
     const d = /^Digit([0-9])$/.exec(e.code);
     if (d) {
       const b = byName[JUMP[Number(d[1])]];
-      if (b) gotoBody(b, b.spec.sun ? 40 : 4.2);
+      if (b && mode === 'orbit') flyTo(b);
+      else if (b) gotoBody(b, b.spec.sun ? 40 : 4.2);
     }
   });
   addEventListener('keyup', (e) => { keys[e.code] = false; });
   addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
   canvas.addEventListener('click', () => {
-    if (document.pointerLockElement !== canvas) canvas.requestPointerLock();
+    if (mode === 'fly' && document.pointerLockElement !== canvas) canvas.requestPointerLock();
+  });
+  canvas.addEventListener('dblclick', (e) => {
+    if (mode !== 'orbit') return;
+    const b = pickBody(e.clientX, e.clientY);
+    if (b) flyTo(b);
   });
   let dragging = false;
-  canvas.addEventListener('mousedown', (e) => { if (e.button === 2) dragging = true; });
-  addEventListener('mouseup', () => { dragging = false; });
+  // orbit-mode drag: left rotates, right / middle / shift+left pans
+  let drag = null;
+  canvas.addEventListener('pointerdown', (e) => {
+    if (mode === 'fly') { if (e.button === 2) dragging = true; return; }
+    drag = { pan: e.button === 1 || e.button === 2 || e.shiftKey };
+    canvas.setPointerCapture(e.pointerId);
+    canvas.style.cursor = 'grabbing';
+  });
+  const endDrag = () => {
+    dragging = false;
+    drag = null;
+    canvas.style.cursor = mode === 'orbit' ? 'grab' : '';
+  };
+  addEventListener('pointerup', endDrag);
+  addEventListener('pointercancel', endDrag);
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+  canvas.addEventListener('pointermove', (e) => {
+    if (!drag || mode !== 'orbit') return;
+    if (flight) {
+      // grabbing the view mid-trip ends the trip where it is
+      goal.yaw = cam.yaw; goal.pitch = cam.pitch; goal.dist = orbit.dist;
+      const B = target.pos, { f } = camBasis();
+      orbit.pan = [cam.x + f[0] * orbit.dist - B[0], cam.y + f[1] * orbit.dist - B[1],
+        cam.z + f[2] * orbit.dist - B[2]];
+      flight = null;
+    }
+    if (drag.pan) {
+      // move the focus so the point under the cursor stays under the cursor
+      const { r, u } = camBasis();
+      const s = orbit.dist * 2 * Math.tan(cam.fovY * 0.5) / canvas.getBoundingClientRect().height;
+      for (let i = 0; i < 3; i++) orbit.pan[i] += (-r[i] * e.movementX + u[i] * e.movementY) * s;
+    } else {
+      goal.yaw += e.movementX * 0.005;
+      goal.pitch = clampPitch(goal.pitch - e.movementY * 0.005);
+    }
+  });
   addEventListener('mousemove', (e) => {
-    if (document.pointerLockElement === canvas || dragging) {
+    if (mode === 'fly' && (document.pointerLockElement === canvas || dragging)) {
       cam.yaw += e.movementX * 0.0022;
-      cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch - e.movementY * 0.0022));
+      cam.pitch = clampPitch(cam.pitch - e.movementY * 0.0022);
     }
   });
   let speedScale = 1;
-  addEventListener('wheel', (e) => {
-    speedScale = Math.max(1e-4, Math.min(1e4, speedScale * (e.deltaY < 0 ? 1.25 : 1 / 1.25)));
-  }, { passive: true });
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    if (mode === 'fly') {
+      speedScale = Math.max(1e-4, Math.min(1e4, speedScale * (e.deltaY < 0 ? 1.25 : 1 / 1.25)));
+      return;
+    }
+    if (flight) return;
+    // deltaMode 1 is lines (Firefox), otherwise pixels; trackpads send many small steps
+    zoomBy(Math.exp(Math.max(-3, Math.min(3, e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0015)))));
+  }, { passive: false });
 
-  function updateCamera(dt) {
+  function flyCamera(dt) {
     // Flight speed is tied to how far the nearest surface is, which is the only way a single
     // control feels right both 2 km above Europa and 20 AU out in the dark.
     const base = Math.min(Math.max(nearestGap, 1e-5), 3.0e5) * 0.55;
@@ -752,6 +950,29 @@ async function main() {
     cam.x += (fwd * cp * sy + str * cy) * v;
     cam.y += (fwd * sp + up) * v;
     cam.z += (-fwd * cp * cy + str * sy) * v;
+  }
+
+  function updateCamera(dt) {
+    if (mode === 'orbit') {
+      if (flight) stepFlight(dt);
+      else {
+        // keys: A/D and arrows orbit, W/S zoom, Shift is faster
+        const fast = keys.ShiftLeft || keys.ShiftRight ? 3 : 1;
+        const kx = (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft ? 1 : 0);
+        const ky = (keys.ArrowUp ? 1 : 0) - (keys.ArrowDown ? 1 : 0);
+        const kz = (keys.KeyS ? 1 : 0) - (keys.KeyW ? 1 : 0);
+        goal.yaw -= kx * dt * 1.2 * fast;
+        goal.pitch = clampPitch(goal.pitch - ky * dt * 1.2 * fast);
+        if (kz) zoomBy(Math.exp(kz * dt * 1.5 * fast));
+        const k = 1 - Math.exp(-dt * 12);
+        cam.yaw += (goal.yaw - cam.yaw) * k;
+        cam.pitch += (goal.pitch - cam.pitch) * k;
+        orbit.dist = Math.exp(Math.log(orbit.dist) + (Math.log(goal.dist) - Math.log(orbit.dist)) * k);
+        placeOrbit();
+      }
+    } else {
+      flyCamera(dt);
+    }
     // never fall inside a body
     for (const b of bodies) {
       const dx = cam.x - b.pos[0], dy = cam.y - b.pos[1], dz = cam.z - b.pos[2];
@@ -977,6 +1198,118 @@ async function main() {
   const hudFps = document.getElementById('fps');
   const hudInfo = document.getElementById('info');
   function hudTarget() { if (hudInfo) hudInfo.textContent = 'target: ' + target.spec.n; }
+  const hudNav = document.getElementById('nav');
+  function hudMode() {
+    canvas.style.cursor = mode === 'orbit' ? 'grab' : '';
+    if (!hudNav) return;
+    hudNav.textContent = mode === 'orbit'
+      ? 'orbit · drag rotate · wheel or W/S zoom · right-drag pan · double-click a body to go · F free-fly'
+      : 'free-fly · click: mouse look · WASD move · Space/E up · Q/C down · Shift fast · wheel speed · F orbit';
+  }
+  hudMode();
+
+  // --------------------------------------------------------------------------------------
+  // Orbit overlay
+  // --------------------------------------------------------------------------------------
+  // Seen as a whole system every planet is far below a pixel, so a 2D layer over the render
+  // draws the orbits as lines and marks each planet with a ring and its name. It fades out as
+  // the camera closes on a body, where an orbit line would cut straight across the disc.
+  const ov = document.getElementById('ov');
+  const ovx = ov.getContext('2d');
+  let showOrbits = qs.get('orbits') !== '0';
+  const ORBIT_N = 360;
+  const ORBIT_COL = {
+    Mercury: '#b9b0a6', Venus: '#e9d29e', Earth: '#7fb4ff', Mars: '#e57d55', Jupiter: '#dcb68c',
+    Saturn: '#e8d293', Uranus: '#a3e3e8', Neptune: '#7392ff', Pluto: '#c8a990',
+  };
+  const planets = bodies.filter((b) => !b.spec.sun && !b.spec.parent);
+  // the ellipses drift over centuries, so sampling them once is plenty
+  const orbitPts = planets.map((b) => {
+    const T = (jd - J2000) / 36525, tmp = [0, 0, 0];
+    const pts = new Float64Array(ORBIT_N * 3);
+    for (let i = 0; i < ORBIT_N; i++) {
+      orbitPoint(KEP[b.spec.n], T, (i / ORBIT_N) * 2 * Math.PI, tmp);
+      pts[i * 3] = tmp[0]; pts[i * 3 + 1] = tmp[1]; pts[i * 3 + 2] = tmp[2];
+    }
+    return pts;
+  });
+
+  function drawOverlay() {
+    if (ov.width !== W || ov.height !== H) { ov.width = W; ov.height = H; }
+    ovx.clearRect(0, 0, W, H);
+    // gone within ~1 Gm of a surface, full strength from ~10 Gm out
+    const fade = Math.max(0, Math.min(1, Math.log10(Math.max(nearestGap, 1) / 1e3)));
+    if (!showOrbits || fade <= 0) return;
+    const tanY = Math.tan(cam.fovY * 0.5), tanX = tanY * W / H;
+    const sx = W / (2 * tanX), sy = H / (2 * tanY);
+    const { f, r, u } = camBasis();
+    const px = W / Math.max(1, ov.clientWidth);   // render pixels per CSS pixel
+    const out = [0, 0, 0];
+    // screen position and depth, or false if behind the camera
+    const project = (x, y, z) => {
+      const dx = x - cam.x, dy = y - cam.y, dz = z - cam.z;
+      const zc = dx * f[0] + dy * f[1] + dz * f[2];
+      if (zc <= 1e-3) return false;
+      out[0] = W * 0.5 + ((dx * r[0] + dy * r[1] + dz * r[2]) / zc) * sx;
+      out[1] = H * 0.5 - ((dx * u[0] + dy * u[1] + dz * u[2]) / zc) * sy;
+      out[2] = zc;
+      return true;
+    };
+
+    ovx.lineWidth = 1.2 * px;
+    for (let i = 0; i < planets.length; i++) {
+      const pts = orbitPts[i];
+      ovx.strokeStyle = ORBIT_COL[planets[i].spec.n] || '#ccc';
+      ovx.globalAlpha = (planets[i] === target ? 0.8 : 0.4) * fade;
+      ovx.beginPath();
+      let pen = false;
+      for (let j = 0; j <= ORBIT_N; j++) {
+        const k = (j % ORBIT_N) * 3;
+        if (project(pts[k], pts[k + 1], pts[k + 2])) {
+          if (pen) ovx.lineTo(out[0], out[1]); else ovx.moveTo(out[0], out[1]);
+          pen = true;
+        } else pen = false;
+      }
+      ovx.stroke();
+    }
+
+    ovx.font = `${Math.round(12 * px)}px system-ui, sans-serif`;
+    ovx.textBaseline = 'middle';
+    // From far out the Sun is below a pixel too, and the renderer only ray-traces its disc.
+    // Labels go to the target planet first, then outward in, the Sun last; one that would
+    // overlap a label already placed is dropped, so the crowded inner system stays readable.
+    const order = [...planets].sort((a, b) =>
+      (b === target) - (a === target) || planets.indexOf(b) - planets.indexOf(a)).concat(SUN_B);
+    const placed = [];
+    for (const b of order) {
+      if (!project(b.pos[0], b.pos[1], b.pos[2])) continue;
+      const x = out[0], y = out[1];
+      if (x < -50 || y < -50 || x > W + 50 || y > H + 50) continue;
+      const col = b === SUN_B ? '#ffe9b0' : ORBIT_COL[b.spec.n] || '#ccc';
+      const disc = (b.req / out[2]) * sy;
+      const ring = Math.max(disc + 3 * px, 4 * px);
+      if (b !== SUN_B || disc < 1.5 * px) {
+        ovx.globalAlpha = fade;
+        ovx.strokeStyle = col;
+        ovx.beginPath();
+        ovx.arc(x, y, ring, 0, 2 * Math.PI);
+        ovx.stroke();
+      }
+      if (disc < 1.5 * px) {
+        ovx.fillStyle = col;
+        ovx.beginPath();
+        ovx.arc(x, y, (b === SUN_B ? 2.5 : 1.6) * px, 0, 2 * Math.PI);
+        ovx.fill();
+      }
+      const lx = x + ring + 4 * px, lw = ovx.measureText(b.spec.n).width, lh = 12 * px;
+      if (placed.some((p) => lx < p[0] + p[2] && p[0] < lx + lw && y - lh / 2 < p[1] + lh / 2 && p[1] - lh / 2 < y + lh / 2)) continue;
+      placed.push([lx, y, lw]);
+      ovx.fillStyle = b === target ? '#ffd79a' : '#e8e2d6';
+      ovx.globalAlpha = (b === target ? 1 : 0.85) * fade;
+      ovx.fillText(b.spec.n, lx, y);
+    }
+    ovx.globalAlpha = 1;
+  }
 
   // --------------------------------------------------------------------------------------
   // Frame
@@ -996,6 +1329,9 @@ async function main() {
     cam.x = v[0]; cam.y = v[1]; cam.z = v[2];
     cam.yaw = (v[3] || 0) * D2R; cam.pitch = (v[4] || 0) * D2R;
     if (qs.get('to')) setTarget(byName[qs.get('to')] || target);
+  } else if (qs.get('view') === 'system' || qs.get('view') === 'inner') {
+    overview = qs.get('view') === 'system' ? 1 : 2;
+    systemView(overview === 1 ? 33 : 1.75, true);
   } else {
     gotoBody(byName[qs.get('to') || 'Saturn'] || byName.Saturn, Number(qs.get('d')) || 4.2,
       qs.has('ph') ? Number(qs.get('ph')) : undefined);
@@ -1017,6 +1353,7 @@ async function main() {
     trackTarget();
     updateCamera(dt);
     writeScene((jd - J2000) * 86400);
+    drawOverlay();
 
     if (fpsT > 0.4) {
       const fps = fpsN / fpsAcc;
@@ -1025,7 +1362,9 @@ async function main() {
         : km > 1e4 ? (km / 1000).toFixed(0) + ' Mm' : km.toFixed(1) + ' km';
       hudFps.textContent = `${fps.toFixed(0)} fps  ${(1000 / fps).toFixed(2)} ms` +
         (hasTS ? `  |  GPU ${gpuMs.toFixed(2)} ms` : '') +
-        `  |  ${nearest.spec.n} +${d}  |  x${speedScale < 1 ? speedScale.toFixed(3) : speedScale.toFixed(1)}  ${W}x${H}`;
+        `  |  ${nearest.spec.n} +${d}  |  ` +
+        (mode === 'orbit' ? 'orbit' : `x${speedScale < 1 ? speedScale.toFixed(3) : speedScale.toFixed(1)}`) +
+        `  ${W}x${H}`;
       fpsAcc = 0; fpsN = 0; fpsT = 0;
     }
 
@@ -1129,7 +1468,9 @@ async function main() {
     }
     buf.unmap();
     const oc = new OffscreenCanvas(W, H);
-    oc.getContext('2d').putImageData(img, 0, 0);
+    const oc2 = oc.getContext('2d');
+    oc2.putImageData(img, 0, 0);
+    oc2.drawImage(ov, 0, 0, W, H);
     const jpg = /\.jpe?g$/i.test(shotName);
     const blob = await oc.convertToBlob(jpg ? { type: 'image/jpeg', quality: 0.92 }
                                            : { type: 'image/png' });

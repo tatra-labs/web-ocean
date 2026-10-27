@@ -7,6 +7,7 @@
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
+  #ov { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; }
   #hud { position: fixed; left: 12px; top: 10px; font: 12px/1.45 ui-monospace, Consolas, monospace; color: #e8e2d6;
          text-shadow: 0 1px 2px #000a; pointer-events: none; user-select: none; }
   #hud .help { opacity: .7; }
@@ -22,11 +23,12 @@
 </head>
 <body>
 <canvas id="c"></canvas>
+<canvas id="ov"></canvas>
 <div id="hud">
   <div id="fps">starting…</div>
   <div id="info"></div>
-  <div class="help">click: mouse look · WASD move · Space/E up · Q/C down · Shift fast · wheel speed</div>
-  <div class="help">0–9 jump to Sun/planets · [ ] change target · G go to target · H panel</div>
+  <div class="help" id="nav"></div>
+  <div class="help">V whole system / inner planets · O orbits · 0–9 go to Sun/planets · [ ] change target · G go to target · H panel</div>
 </div>
 <div id="panel" class="hidden"></div>
 <div id="err"></div>

@@ -59,6 +59,30 @@ After editing anything under `js/`, run `npm run build` to regenerate both bundl
 
 ## Controls
 
+The camera starts in **orbit** mode, circling the current target:
+
+| Input | Action |
+|---|---|
+| Left drag | Rotate around the target |
+| Mouse wheel, W / S | Zoom in / out |
+| Right drag (or middle, or Shift + left) | Pan |
+| A / D, arrow keys | Rotate around the target from the keyboard (Shift is faster) |
+| Double-click a body | Fly to it and orbit it |
+| V | Fly out to the whole system; press again for the inner planets |
+| O | Show / hide the orbit lines and planet labels |
+| 0 – 9 | Fly to the Sun, Mercury, Venus, Earth, Mars, Jupiter, Saturn, Uranus, Neptune, Pluto |
+| `[` `]` | Fly to the previous / next body (includes the moons) |
+| G | Fly back to the current target's default view |
+| F | Switch to free-fly mode and back |
+| H | Settings panel |
+
+Zoom scales the height above the surface rather than the distance to the centre, so one wheel
+step is as useful twenty kilometres above the Moon as it is twenty AU out. Trips between bodies
+interpolate the distance in log space and pull back mid-flight, so the camera never streaks
+past a planet in one frame.
+
+In **free-fly** mode (F):
+
 | Input | Action |
 |---|---|
 | Click the canvas | Capture the mouse (Esc releases it). Holding the right mouse button also works. |
@@ -67,20 +91,24 @@ After editing anything under `js/`, run `npm run build` to regenerate both bundl
 | Space or E / Q or C | Up / down |
 | Shift | 6x speed |
 | Mouse wheel | Change speed |
-| 0 – 9 | Jump to the Sun, Mercury, Venus, Earth, Mars, Jupiter, Saturn, Uranus, Neptune, Pluto |
-| `[` `]` | Change target (includes the moons) |
-| G | Go to the current target |
-| H | Settings panel |
+| 0 – 9, G | Jump straight to a body |
 
 Flight speed scales with the distance to the nearest surface, which is the only way one
-control can feel right both two kilometres above Europa and twenty AU out in the dark. The
-camera holds station in the target body's frame — Earth moves at 30 km/s and the time scale
-multiplies that, so an inertial camera would be left behind within a couple of frames.
+control can feel right both two kilometres above Europa and twenty AU out in the dark. In both
+modes the camera holds station in the target body's frame — Earth moves at 30 km/s and the
+time scale multiplies that, so an inertial camera would be left behind within a couple of
+frames.
 
 URL parameters are handy for testing. `?w=2560&h=1440` forces the render resolution,
 `to=Saturn` picks the body, `d=5.5` sets the distance in body radii, `ph=152` sets the phase
 angle (small = sun behind you, large = backlit), `fov=16` zooms, `ui=0` hides the HUD, and any
-settings key works too, for example `ringAlbedo=0.95&timeScale=20000`.
+settings key works too, for example `ringAlbedo=0.95&timeScale=20000`. `nav=fly` starts in
+free-fly mode, `view=system` or `view=inner` starts in the overview, and `orbits=0` hides the
+orbit overlay.
+
+From far out every planet is far below a pixel, so a 2D overlay draws each orbit (traced from
+the same Keplerian elements as the ephemeris) and marks each planet with a ring and its name.
+It fades out as the camera closes on a body, where an orbit line would cut across the disc.
 
 `dbg=1` shows raw albedo, `dbg=2` shows the LEAN slope sigma, `dbg=3` point-samples the ring
 profile instead of prefiltering it, and `dbg=4` keeps the mip average but drops the second
